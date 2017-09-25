@@ -71,12 +71,12 @@ class MultiDimensionalLSTMCell(RNNCell):
             return new_h, new_state
 
 
-def multi_dimensional_rnn_while_loop(rnn_size, input_data, sh, dims=None, scope_n="layer1"):
+def multi_dimensional_rnn_while_loop(rnn_size, input_data, context_wind_shape, dims=None, scope_n="layer1"):
     """Implements naive multi dimension recurrent neural networks
 
     @param rnn_size: the hidden units
     @param input_data: the data to process of shape [batch,h,w,channels]
-    @param sh: [height,width] of the windows
+    @param context_wind_shape: [height,width] of the windows
     @param dims: dimensions to reverse the input data,eg.
         dims=[False,True,True,False] => true means reverse dimension
     @param scope_n : the scope
@@ -91,74 +91,120 @@ def multi_dimensional_rnn_while_loop(rnn_size, input_data, sh, dims=None, scope_
         # Get the symbolic shape of the data
         # shape: (batch_size, height, width, input_dim)
         shape = tf.shape(input_data)
+        batch_size, h, w, inp_dim = tf.unstack(shape)
 
         # Add padding if the height and width is not evenly divisible by the context window sizes
-        if shape[1] % sh[0] != 0:
-            offset = tf.zeros([shape[0], sh[0] - (shape[1] % sh[0]), shape[2], shape[3]])
-            input_data = tf.concat(1, [input_data, offset])
-            shape = input_data.get_shape().as_list()
-        if shape[2] % sh[1] != 0:
-            offset = tf.zeros([shape[0], shape[1], sh[1] - (shape[2] % sh[1]), shape[3]])
-            input_data = tf.concat(2, [input_data, offset])
-            shape = input_data.get_shape().as_list()
+        # Symbolic pad function
+        def pad(value, axis, context_size):
+            shp = tf.shape(value)
+            m = tf.mod(shp[axis], context_size)
+            pad_amt = tf.cond(
+                tf.not_equal(m, 0),
+                lambda: context_size - m,
+                lambda: tf.constant(0)
+            )
 
-        h, w = int(shape[1] / sh[0]), int(shape[2] / sh[1])
-        features = sh[1] * sh[0] * shape[3]
-        batch_size = shape[0]
+            pad_shape = tf.unstack(shp)
+            pad_shape[axis] = pad_amt
 
-        x = tf.reshape(input_data, [batch_size, h, w, features])
+            padding = tf.zeros(shape=pad_shape)
+
+            return tf.concat([value, padding], axis=axis)
+
+        # Pad the height
+        input_data_padded = pad(input_data, 1, context_wind_shape[0])
+
+        # Pad the width
+        input_data_padded = pad(input_data_padded, 2, context_wind_shape[1])
+
+        # Calculate the reduced height and width dimensions to account for context windows
+        h_red, w_red = tf.unstack(tf.shape(input_data_padded[0, :, :, 0]))
+        h_red, w_red = h_red / context_wind_shape[0], w_red / context_wind_shape[1]
+
+        # Recalculate the feature dimension to account for the size of context window
+        context_features_size = context_wind_shape[1] * context_wind_shape[0] * input_data_padded.get_shape().as_list()[-1]
+
+        # Reshape input data to group the features in a context window
+        x = tf.reshape(input_data, [batch_size, h_red, w_red, context_features_size])
+
+        # Perform reversing of dimensions
         if dims is not None:
             assert dims[0] is False and dims[3] is False
             x = tf.reverse(x, dims)
-        x = tf.transpose(x, [1, 2, 0, 3])
-        x = tf.reshape(x, [-1, features])
-        x = tf.split(axis=0, num_or_size_splits=h * w, value=x)
 
-        sequence_length = tf.ones(shape=(batch_size,), dtype=tf.int32) * shape[0]
-        inputs_ta = tf.TensorArray(dtype=tf.float32, size=h * w, name='input_ta')
+        # Shuffle dimensions to look like (height, width, batch_size, context_wind_feature_size)
+        x = tf.transpose(x, [1, 2, 0, 3])
+        x = tf.reshape(x, [-1, batch_size, context_features_size])
+        # x = tf.split(axis=0, num_or_size_splits=h * w, value=x)
+
+        # sequence_length = tf.ones(shape=(batch_size,), dtype=tf.int32) * shape[0]
+        inputs_ta = tf.TensorArray(dtype=tf.float32, size=h_red * w_red, name='input_ta')
         inputs_ta = inputs_ta.unstack(x)
-        states_ta = tf.TensorArray(dtype=tf.float32, size=h * w + 1, name='state_ta', clear_after_read=False)
-        outputs_ta = tf.TensorArray(dtype=tf.float32, size=h * w, name='output_ta')
+        states_ta = tf.TensorArray(dtype=tf.float32, size=h_red * w_red + 1, name='state_ta', clear_after_read=False)
+        outputs_ta = tf.TensorArray(dtype=tf.float32, size=h_red * w_red, name='output_ta')
 
         # initial cell and hidden states
         states_ta = states_ta.write(h * w, LSTMStateTuple(tf.zeros([batch_size, rnn_size], tf.float32),
                                                           tf.zeros([batch_size, rnn_size], tf.float32)))
 
+        # helper methods for getting the index of the above state and the left state
         def get_up(t_, w_):
+            # state above is one row back from the current index
             return t_ - tf.constant(w_)
 
         def get_last(t_, w_):
+            # state to the left is just one index back from the current index
             return t_ - tf.constant(1)
 
+        # initialize step counters for the multi-dimensional while loop
         time = tf.constant(0)
         zero = tf.constant(0)
 
+        # body of while loop
         def body(time_, outputs_ta_, states_ta_):
-            state_up = tf.cond(tf.less_equal(tf.constant(w), time_),
-                               lambda: states_ta_.read(get_up(time_, w)),
-                               lambda: states_ta_.read(h * w))
-            state_last = tf.cond(tf.less(zero, tf.mod(time_, tf.constant(w))),
-                                 lambda: states_ta_.read(get_last(time_, w)),
-                                 lambda: states_ta_.read(h * w))
 
+            # if not in first row, state up is one row back. otherwise it's the 0 state we have a placeholder for
+            state_up = tf.cond(tf.less_equal(tf.constant(w_red), time_),
+                               lambda: states_ta_.read(get_up(time_, w_red)),
+                               lambda: states_ta_.read(h_red * w_red))
+
+            # if not the first column, state is one index back. otherwise it's the 0 state we hav ea placeholderfor
+            state_last = tf.cond(tf.less(zero, tf.mod(time_, tf.constant(w_red))),
+                                 lambda: states_ta_.read(get_last(time_, w_red)),
+                                 lambda: states_ta_.read(h_red * w_red))
+
+            # Combine the cell states for the up and left states into a tuple
             current_state = state_up[0], state_last[0], state_up[1], state_last[1]
+
+            # Run the multi-dimensional cell step
             out, state = cell(inputs_ta.read(time_), current_state)
+
+            # Write the output and the cell state
             outputs_ta_ = outputs_ta_.write(time_, out)
-            states_ta_ = states_ta_.write(time_, state)
+            states_ta_ = states_ta_.write(time_, state)  # bc multi-dim, need to actually record states
+
             return time_ + 1, outputs_ta_, states_ta_
 
+        # while loop conditional
         def condition(time_, outputs_ta_, states_ta_):
-            return tf.less(time_, tf.constant(h * w))
+            return tf.less(time_, tf.constant(h_red * w_red))
 
         result, outputs_ta, states_ta = tf.while_loop(condition, body, [time, outputs_ta, states_ta],
                                                       parallel_iterations=1)
 
+        # stack the outputs and states
         outputs = outputs_ta.stack()
         states = states_ta.stack()
 
-        y = tf.reshape(outputs, [h, w, batch_size, rnn_size])
+        # reshape (do we need this?)
+        y = tf.reshape(outputs, [h_red, w_red, batch_size, rnn_size])
+
+        # put the batch back as the first dimension
         y = tf.transpose(y, [2, 0, 1, 3])
+
+        # reverse back on dims if we had reversed originally
         if dims is not None:
             y = tf.reverse(y, dims)
 
+        # returns the hidden outputs and the states
         return y, states

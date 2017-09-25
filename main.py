@@ -21,7 +21,7 @@ def create_bias_variable(name, shape):
 
 
 def multi_dimensional_lstm(input_data, rnn_size):
-    rnn_out, _ = multi_dimensional_rnn_while_loop(rnn_size=rnn_size, input_data=input_data, sh=[1, 1])
+    rnn_out, _ = multi_dimensional_rnn_while_loop(rnn_size=rnn_size, input_data=input_data, context_wind_shape=[1, 1])
     return rnn_out
 
 
@@ -50,7 +50,7 @@ def run(m_id):
     hidden_size = 4
     if use_multi_dimensional_lstm:
         print('Using Multi Dimensional LSTM !')
-        rnn_out, _ = multi_dimensional_rnn_while_loop(rnn_size=hidden_size, input_data=x, sh=[1, 1])
+        rnn_out, _ = multi_dimensional_rnn_while_loop(rnn_size=hidden_size, input_data=x, context_wind_shape=[1, 1])
     else:
         print('Using Standard LSTM !')
         rnn_out = standard_lstm(input_data=x, rnn_size=hidden_size)
